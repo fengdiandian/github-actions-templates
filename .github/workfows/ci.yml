@@ -1,0 +1,16 @@
+# any-project/.github/workflows/ci.yml  
+name: CI 
+ 
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+ 
+jobs:
+  ci:
+    uses: your-org/github-actions-templates/.github/workflows/universal-pipeline.yml@main  
+    with:
+      project_repo: ${{ github.repository  }} # 自动传递 org/project-name 
+      deploy_to_prod: ${{ github.ref  == 'refs/heads/main' || startsWith(github.ref,  'refs/tags/v') }}
+    secrets: inherit # 继承所有secrets，中央workflow会按需取用 
