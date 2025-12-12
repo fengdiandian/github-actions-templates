@@ -1,0 +1,195 @@
+# github-actions-templates/.github/workflows/universal-pipeline.yml 
+name: Universal CI/CD Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      # 从项目仓库接收的输入
+      project_repo:
+        description: 'The repository name of the project (e.g., org/project-name)'
+        required: true
+      dockerfile_path:
+        description: 'Path to Dockerfile'
+        required: false
+        default: './Dockerfile'
+      k8s_manifest_path:
+        description: 'Path to K8s manifest'
+        required: false
+        default: './k8s/deployment.yaml' 
+      deploy_to_prod:
+        description: 'Force deploy to production'
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      # 从项目仓库继承的secrets
+      KUBECONFIG:
+        required: true
+      NOTIFICATION_EMAIL:
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+
+env:
+  # 从中央仓库获取自己的secrets
+  REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+  REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+jobs:
+  # Step 1: 读取中央配置，确定镜像仓库
+  load-config:
+    runs-on: ubuntu-latest
+    outputs:
+      image-registry: ${{ steps.config.outputs.image-registry  }}
+      image-name: ${{ steps.config.outputs.image-name  }}
+    steps:
+      - name: Checkout central repo
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/github-actions-templates
+          ref: main
+          path: central-config
+
+      - name: Determine image registry and name
+        id: config
+        run: |
+          # 默认配置
+          REGISTRY=$(yq eval '.default.registry'  central-config/config/registry-config.yml) 
+          
+          # 检查项目特定配置
+          PROJECT_PATH="${{ inputs.project_repo  }}"
+          while IFS= read -r key; do
+            if [[ "$PROJECT_PATH" == $key ]]; then
+              REGISTRY=$(yq eval ".projects.\"$key\".registry" central-config/config/registry-config.yml) 
+              break
+            fi
+          done < <(yq eval '.projects | keys | .[]' central-config/config/registry-config.yml) 
+          
+          # 提取项目名作为镜像名
+          IMAGE_NAME=$(echo $PROJECT_PATH | cut -d'/' -f2)
+          
+          echo "image-registry=$REGISTRY" >> $GITHUB_OUTPUT
+          echo "image-name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Using registry: $REGISTRY for image: $IMAGE_NAME"
+
+  # Step 2: 构建、检测和推送镜像
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: load-config
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version  }}
+      is-production: ${{ steps.prod-check.outputs.is-production  }}
+    steps:
+      - name: Checkout project code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.project_repo  }}
+
+      - name: Detect language
+        id: detect
+        run: |
+          if [ -f "package.json"  ]; then echo "language=Node.js"  >> $GITHUB_OUTPUT; fi
+          if [ -f "pom.xml"  ]; then echo "language=Java" >> $GITHUB_OUTPUT; fi
+          if [ -f "requirements.txt"  ]; then echo "language=Python" >> $GITHUB_OUTPUT; fi
+          if [ -f "go.mod"  ]; then echo "language=Go" >> $GITHUB_OUTPUT; fi
+
+      - name: Setup language
+        uses: fengdiandian/github-actions-templates/.github/actions/setup-language@main
+        with:
+          language: ${{ steps.detect.outputs.language  }}
+
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ needs.load-config.outputs.image-registry  }}
+          username: ${{ env.REGISTRY_USERNAME }}
+          password: ${{ env.REGISTRY_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.load-config.outputs.image-registry  }}/${{ needs.load-config.outputs.image-name  }}
+          tags: |
+            type=ref,event=branch,suffix=-{{sha}}
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ inputs.dockerfile_path  }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags  }}
+          labels: ${{ steps.meta.outputs.labels  }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check production deployment
+        id: prod-check
+        run: |
+          IS_PROD=false
+          if [[ "${{ inputs.deploy_to_prod  }}" == "true" || "${{ github.ref_type  }}" == "tag" ]]; then
+            IS_PROD=true
+          fi
+          echo "is-production=$IS_PROD" >> $GITHUB_OUTPUT
+
+  # Step 3: 生产审批
+  approve-production:
+    runs-on: ubuntu-latest
+    needs: [load-config, build-and-push]
+    if: needs.build-and-push.outputs.is-production  == 'true'
+    environment:
+      name: production
+    steps:
+      - name: Wait for approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: team-leads
+          minimum-approvals: 1
+          timeout-minutes: 60
+          message: "Deploy ${{ needs.load-config.outputs.image-name  }}:${{ needs.build-and-push.outputs.image-tag  }} to PRODUCTION?"
+
+  # Step 4: 部署
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [load-config, build-and-push, approve-production]
+    if: always() && needs.build-and-push.result  == 'success' && (needs.build-and-push.outputs.is-production  == 'false' || needs.approve-production.result  == 'success')
+    environment:
+      name: ${{ needs.build-and-push.outputs.is-production  == 'true' && 'production' || 'staging' }}
+    steps:
+      - name: Checkout project code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.project_repo  }}
+
+      - name: Deploy to K8s
+        run: |
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+          
+          NAMESPACE="${{ needs.build-and-push.outputs.is-production  == 'true' && 'production' || 'staging' }}"
+          IMAGE="${{ needs.load-config.outputs.image-registry  }}/${{ needs.load-config.outputs.image-name  }}:${{ needs.build-and-push.outputs.image-tag  }}"
+          
+          kubectl set image deployment/${{ needs.load-config.outputs.image-name  }} app=$IMAGE -n $NAMESPACE
+          kubectl rollout status deployment/${{ needs.load-config.outputs.image-name  }} -n $NAMESPACE --timeout=300s
+
+  # Step 5: 通知
+  notify:
+    runs-on: ubuntu-latest
+    needs: [load-config, build-and-push, deploy]
+    if: always()
+    steps:
+      - name: Notify on Slack
+        if: secrets.SLACK_WEBHOOK
+        run: |
+          STATUS="✅ Success"
+          if [[ "${{ needs.deploy.result  }}" != "success" ]]; then
+            STATUS="❌ Failed"
+          fi
+          curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\"$STATUS: ${{ needs.load-config.outputs.image-name  }} deployed to ${{ needs.build-and-push.outputs.is-production  == 'true' && 'Production' || 'Staging' }}\"}" \
+          ${{ secrets.SLACK_WEBHOOK }}
