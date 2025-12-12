@@ -47,7 +47,7 @@ jobs:
       - name: Checkout central repo 
         uses: actions/checkout@v4 
         with:
-          repository: your-org/github-actions-templates 
+          repository: fengdiandian/github-actions-templates 
           ref: main 
           path: central-config 
  
@@ -95,7 +95,7 @@ jobs:
           if [ -f "go.mod"  ]; then echo "language=Go" >> $GITHUB_OUTPUT; fi 
  
       - name: Setup language 
-        uses: your-org/github-actions-templates/.github/actions/setup-language@main 
+        uses: fengdiandian/github-actions-templates/.github/actions/setup-language@main 
         with:
           language: ${{ steps.detect.outputs.language  }}
  
