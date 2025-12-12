@@ -1,0 +1,19 @@
+# any-project/.github/workflows/ci.yml 
+
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  # 确保 'ci' job 下只有 'uses' 一个顶级键
+  ci:
+    # 将整个 uses 的值用双引号包裹，以避免 YAML 解析器产生歧义
+    uses: 360849362/github-actions-templates/.github/workflows/universal-pipeline.yaml@main 
+    with:
+      project_repo: ${{ github.repository  }}
+      deploy_to_prod: ${{ github.ref  == 'refs/heads/main' || startsWith(github.ref,  'refs/tags/v') }}
+    secrets: inherit
